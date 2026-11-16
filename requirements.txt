@@ -1,0 +1,2 @@
+# Plotting only; benchmark runner and validation use Python's standard library.
+matplotlib>=3.7,<4

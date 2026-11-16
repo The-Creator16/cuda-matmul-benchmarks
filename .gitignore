@@ -1,0 +1,9 @@
+/build*/
+__pycache__/
+*.py[cod]
+.venv/
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+/results/*
+!/results/README.md
