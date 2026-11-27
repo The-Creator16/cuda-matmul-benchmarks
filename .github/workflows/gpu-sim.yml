@@ -1,0 +1,81 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so the
+# cuda-compile job in checks.yml only builds matmul_bench. This builds it again
+# and runs ctest, including gpu_correctness (scripts/validate.py), on a
+# simulated NVIDIA H100 (https://github.com/pantheongpu/pantheonsim), so the
+# naive, tiled16 and tiled32 kernels and cuBLAS are checked against each other
+# and the CPU reference. A simulator cannot reproduce hardware-specific
+# behavior or timing, so it complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "scripts/validate.py"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ctest:
+    name: ctest (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      # library-path is disabled so that matmul_bench links against and loads
+      # the toolkit's own cuBLAS.
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+          library-path: 'false'
+
+      # 90-virtual embeds PTX only, which the simulator runs, and the simulator
+      # needs a shared CUDA runtime.
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+
+      - name: Build
+        run: cmake --build build -j3
+
+      # A wrong-architecture run can print a VirtualGPU error and still exit 0,
+      # so the output is also searched for device errors and skipped tests.
+      - name: Test
+        working-directory: build
+        run: |
+          vgpu run --counters ctest --output-on-failure -V > ../ctest.log 2>&1 || { tail -n 150 ../ctest.log; exit 1; }
+          grep -E "virtual GPU platform initialized|GPU=|PASS: |tests passed" ../ctest.log | sort | uniq -c
+          grep -q "virtual GPU platform initialized: 1 x nvidia/h100" ../ctest.log
+          if grep -qiE "VirtualGPU error|no CUDA-capable|no CUDA device|\*\*\*Skipped|Not Run|tests were not run" ../ctest.log; then
+            echo "::error::the run reported a device problem or a skipped test"; exit 1
+          fi
+          grep -q "PASS: 34 cases, each checking all four implementations" ../ctest.log
+          grep -q "100% tests passed, 0 tests failed out of 2" ../ctest.log
+          # The simulator's per-launch counters show that the kernels ran.
+          for k in 'matmul_naive' 'matmul_tiled(ILi16E|<16>)' 'matmul_tiled(ILi32E|<32>)'; do
+            echo "$k launches: $(grep -cE "\[vgpu\]\[counters\].*$k" ../ctest.log)"
+            grep -qE "\[vgpu\]\[counters\].*$k" ../ctest.log
+          done
+          echo "all kernel launches: $(grep -c "\[vgpu\]\[counters\]" ../ctest.log)"
